@@ -80,6 +80,10 @@ locations, first run `source scripts/env.sh && source $VENV/bin/activate`, and p
 Settings by GPU memory: on 80 GB use `BATCH=8 ACCUM=2`. On 24 GB use
 `BATCH=2 ACCUM=8 MAX_PADDED_CHARS=24000`. The default (`BATCH=4`) targets 40–48 GB.
 
+Python 3.10 or newer is required (transformers 5.x). `setup_cuda.sh` uses `$PY` if you set
+it, otherwise the first `python3.12`/`3.11`/`3.10` on PATH, otherwise it creates Python 3.12
+with conda in `$WORK/.python`. An existing `.venv` built on an older Python is rebuilt.
+
 If `setup_cuda.sh` fails at causal-conv1d, there was no prebuilt wheel for your torch/CUDA
 combination. Install the CUDA toolkit (nvcc) and rerun, or install a torch version with a
 matching wheel.

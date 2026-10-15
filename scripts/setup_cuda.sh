@@ -7,11 +7,32 @@ cd "$(dirname "$0")/.."
 source scripts/env.sh
 echo "WORK=$WORK"
 
-PY=${PY:-python3}
 REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a   # Qwen3.5-4B revision used by SII-Decision
 
 # 1. environment ------------------------------------------------------------------------------
-if [ ! -d "$VENV" ]; then $PY -m venv "$VENV"; fi
+#    transformers 5.x (needed for Qwen3.5) requires Python >= 3.10. Use $PY if given, else the
+#    first python3.12/3.11/3.10 on PATH, else build Python 3.12 with conda under $WORK/.python.
+py_ok() { "$1" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; }
+if [ -z "${PY:-}" ]; then
+  for candidate in "$WORK/.python/bin/python" python3.12 python3.11 python3.10 python3; do
+    if command -v "$candidate" >/dev/null && py_ok "$candidate"; then PY=$candidate; break; fi
+  done
+fi
+if [ -z "${PY:-}" ]; then
+  command -v conda >/dev/null || { echo "Need Python >= 3.10: set PY=/path/to/python3.1x"; exit 1; }
+  echo "No Python >= 3.10 found; creating one with conda in $WORK/.python"
+  conda create -y -p "$WORK/.python" python=3.12
+  PY=$WORK/.python/bin/python
+fi
+py_ok "$PY" || { echo "$PY is older than 3.10"; exit 1; }
+echo "using $PY ($("$PY" --version))"
+
+# an environment built by an earlier run on an older Python is rebuilt
+if [ -x "$VENV/bin/python" ] && ! py_ok "$VENV/bin/python"; then
+  echo "removing $VENV ($("$VENV/bin/python" --version 2>&1)); rebuilding with $PY"
+  rm -rf "$VENV"
+fi
+if [ ! -d "$VENV" ]; then "$PY" -m venv "$VENV"; fi
 source "$VENV/bin/activate"
 pip install -U pip wheel packaging ninja
 pip install "torch>=2.7"                       # PyPI Linux wheels ship with CUDA 12.x
