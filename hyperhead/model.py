@@ -145,6 +145,22 @@ class HyperHead(nn.Module):
         return row | {'state': self.tokenizer.decode(ids[:budget]) + ' ...'}
 
     # ------------------------------------------------------------------ CPU side
+    def token_lengths(self, rows, chunk=2048):
+        """(spec_lens, decision_lens): prompt lengths in tokens for both passes, capped at
+        max_tokens. Used to build micro-batches by token budget."""
+        spec, decision = [], []
+        for start in range(0, len(rows), chunk):
+            part = rows[start:start + chunk]
+            spec_texts = [data.spec_prompt(self.tokenizer, r)[0] for r in part]
+            if self.mode == 'joint':
+                decision_texts = [data.joint_prompt(self.tokenizer, r, self.labels) for r in part]
+            else:
+                decision_texts = [data.state_prompt(self.tokenizer, r) for r in part]
+            for texts, out in ((spec_texts, spec), (decision_texts, decision)):
+                ids = self.tokenizer(texts, add_special_tokens=False)['input_ids']
+                out.extend(min(len(x), self.max_tokens) for x in ids)
+        return spec, decision
+
     def prepare(self, rows):
         """All CPU work for a batch: prompts, tokenization, option-pooling masks, targets.
         Thread-safe with respect to the GPU passes, so the next batch can be prepared in a

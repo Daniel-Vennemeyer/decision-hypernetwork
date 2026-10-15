@@ -77,14 +77,16 @@ locations, first run `source scripts/env.sh && source $VENV/bin/activate`, and p
 | `joint` / `split` | one epoch, effective batch 16 (`$WORK/runs/joint-4b/best`) |
 | `eval_joint` / `eval_split` | the trained head on validation and JEVal |
 
-**Throughput settings.** `run_4b.sh` picks a preset from the GPU's memory: on 70 GB or more,
-micro-batch 16 without accumulation and gradient checkpointing off; on 40 GB or more, 8 x 2;
-otherwise 2 x 8 with checkpointing on. The effective batch is always 16. A character cap shrinks
-micro-batches of very long rows, and the biggest batch runs first, so a memory problem shows up
-within seconds. Any of `BATCH`, `ACCUM`, `NO_GRAD_CKPT`, `MAX_BATCH_CHARS`, `EVAL_BATCH` and
-`MAX_PADDED_CHARS` overrides the preset. Batches are tokenized in a background thread while the
-GPU works, the decision pass keeps only the 3 hidden layers it reads, and loss logging doesn't
-force a GPU sync each step.
+**Throughput settings.** Micro-batches are bounded by padded token counts, measured by
+tokenizing every row once at startup. The binding limit is the spec (hypernetwork) pass, which
+carries gradients and costs about 8 MB per padded token on Qwen3.5-4B without gradient
+checkpointing. `run_4b.sh` picks a preset from the GPU's memory: on 70 GB or more, up to 16 rows
+and 6,144 padded spec tokens per micro-batch, no accumulation, checkpointing off. The effective
+batch is at most 16 rows. The biggest micro-batch runs first, so a memory problem shows up within
+seconds. Any of `BATCH`, `ACCUM`, `NO_GRAD_CKPT`, `MAX_SPEC_TOKENS`, `MAX_DECISION_TOKENS`,
+`EVAL_BATCH` and `EVAL_DECISION_TOKENS` overrides the preset. Batches are tokenized in a
+background thread while the GPU works, the decision pass keeps only the 3 hidden layers it reads,
+and loss logging doesn't force a GPU sync each step.
 
 **Reading the training log.** The raw `ce` swings with batch difficulty. Batches group rows of
 similar length, which tend to come from the same task, and tasks differ a lot in difficulty.

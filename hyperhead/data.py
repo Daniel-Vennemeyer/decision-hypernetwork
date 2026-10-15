@@ -96,18 +96,24 @@ def convert_jeval(frame):
     return rows
 
 
-def length_batches(rows, tokens_of, batch_size, seed, shuffle=True, max_padded=None):
-    """Groups rows of similar length to limit padding; batch order is shuffled.
+def token_batches(spec_lens, decision_lens, max_rows, max_spec_tokens, max_decision_tokens,
+                  seed=0, shuffle=True):
+    """Micro-batches bounded by padded token counts (rows x longest row) for each pass.
 
-    max_padded caps batch_size * longest length, so very long inputs get smaller batches."""
-    order = sorted(range(len(rows)), key=lambda i: tokens_of(rows[i]))
-    batches, current = [], []
+    Memory is driven by the padded length of the hypernetwork (spec) pass, which carries
+    gradients, so rows are sorted by spec length and then decision length. Batch order is
+    shuffled. Returns lists of row indices."""
+    order = sorted(range(len(spec_lens)), key=lambda i: (spec_lens[i], decision_lens[i]))
+    batches, current, longest_decision = [], [], 0
     for i in order:
-        if current and (len(current) == batch_size or
-                        (max_padded and (len(current) + 1) * tokens_of(rows[i]) > max_padded)):
+        n = len(current) + 1
+        decision = max(longest_decision, decision_lens[i])
+        if current and (n > max_rows or n * spec_lens[i] > max_spec_tokens
+                        or n * decision > max_decision_tokens):
             batches.append(current)
-            current = []
+            current, decision = [], decision_lens[i]
         current.append(i)
+        longest_decision = decision
     if current:
         batches.append(current)
     if shuffle:

@@ -47,8 +47,10 @@ def main():
     ap.add_argument('--eval-rows', type=int, default=1000)
     ap.add_argument('--eval-every', type=int, default=250, help='optimizer steps')
     ap.add_argument('--log-every', type=int, default=10)
-    ap.add_argument('--max-batch-chars', type=int, default=None,
-                    help='caps batch x longest row (characters); long rows get smaller micro-batches')
+    ap.add_argument('--max-spec-tokens', type=int, default=8192,
+                    help='micro-batch cap: rows x longest spec prompt (hypernetwork pass, with grads)')
+    ap.add_argument('--max-decision-tokens', type=int, default=16384,
+                    help='micro-batch cap: rows x longest decision prompt (no grads)')
     ap.add_argument('--no-grad-ckpt', action='store_true',
                     help='keep activations instead of recomputing them: faster, more memory')
     ap.add_argument('--max-steps', type=int, default=None, help='stop early, e.g. for a timing run')
@@ -81,24 +83,29 @@ def main():
 
     optimizer = torch.optim.AdamW([{'params': lora, 'lr': args.lr_lora},
                                    {'params': head, 'lr': args.lr_head}], weight_decay=0.0)
-    length = lambda r: len(r['state']) + len(r['question']) + sum(len(o['desc']) for o in r['options'])
+    # micro-batches by padded token count, so memory stays bounded whatever the row mix
+    started = time.time()
+    spec_lens, decision_lens = model.token_lengths(train_rows)
+    print(f'tokenized {len(train_rows)} rows in {time.time() - started:.0f}s', flush=True)
     batches = []
     for epoch in range(math.ceil(args.epochs)):
-        batches += data.length_batches(train_rows, length, args.batch, args.seed + epoch,
-                                       max_padded=args.max_batch_chars)
-    if args.epochs < 1:
-        keep, seen = [], 0
-        for b in batches:
-            if seen >= args.epochs * len(train_rows):
-                break
-            keep.append(b)
-            seen += len(b)
-        batches = keep
+        batches += data.token_batches(spec_lens, decision_lens, args.batch, args.max_spec_tokens,
+                                      args.max_decision_tokens, seed=args.seed + epoch)
+    keep, seen = [], 0
+    for b in batches:  # fractional epochs
+        if seen >= args.epochs * len(train_rows):
+            break
+        keep.append(b)
+        seen += len(b)
+    batches = keep
     # run the most memory-hungry micro-batch first, so an out-of-memory error shows up in the
     # first seconds (e.g. in the timing stage) rather than hours into training
-    biggest = max(range(len(batches)),
-                  key=lambda b: len(batches[b]) * max(length(train_rows[j]) for j in batches[b]))
+    padded = lambda b: (len(b) * max(spec_lens[j] for j in b), len(b) * max(decision_lens[j] for j in b))
+    biggest = max(range(len(batches)), key=lambda k: padded(batches[k]))
     batches.insert(0, batches.pop(biggest))
+    sizes = [len(b) for b in batches]
+    print(f'{len(batches)} micro-batches, mean {sum(sizes) / len(sizes):.1f} rows; first (largest) has '
+          f'{padded(batches[0])[0]} padded spec / {padded(batches[0])[1]} decision tokens', flush=True)
     total_steps = max(1, len(batches) // args.accum)
     warmup = max(1, int(args.warmup * total_steps))
     schedule = lambda s: min(1.0, (s + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total_steps)))

@@ -13,15 +13,17 @@ from hyperhead import data, metrics
 
 
 @torch.no_grad()
-def predict(model, rows, batch_size=8, max_padded_chars=64000):
-    # characters as a length proxy: ~1 token/char for Chinese, ~4 chars/token for English
-    length = lambda r: len(data.text(r['state'])) + sum(len(o['desc']) for o in r['options'])
+def predict(model, rows, batch_size=8, max_spec_tokens=32768, max_decision_tokens=65536):
+    """Probabilities per row, in row order. Micro-batches are bounded by padded token counts;
+    the next batch is tokenized in a background thread while the current one runs."""
     from hyperhead.model import prefetch
 
+    spec_lens, decision_lens = model.token_lengths(rows)
+    order = data.token_batches(spec_lens, decision_lens, batch_size, max_spec_tokens,
+                               max_decision_tokens, shuffle=False)
     probs = [None] * len(rows)
-    order = data.length_batches(rows, length, batch_size, 0, shuffle=False, max_padded=max_padded_chars)
     prepared = prefetch(model.prepare, ([rows[i] for i in b] for b in order))
-    for batch, ready in zip(order, prepared):  # next batch is tokenized while this one runs
+    for batch, ready in zip(order, prepared):
         logits, _ = model(ready)
         for i, p in zip(batch, logits.float().softmax(-1).tolist()):
             probs[i] = p[:len(rows[i]['options'])]
@@ -41,7 +43,8 @@ def main():
     ap.add_argument('--batch', type=int, default=8)
     ap.add_argument('--max-tokens', type=int, default=None,
                     help='input budget; JEVal inputs go up to 20,480 tokens (default: checkpoint value / 4096)')
-    ap.add_argument('--max-padded-chars', type=int, default=64000, help='caps batch x longest input')
+    ap.add_argument('--max-decision-tokens', type=int, default=65536,
+                    help='micro-batch cap: rows x longest decision prompt')
     ap.add_argument('--out', default=None)
     ap.add_argument('--device', default='auto')
     args = ap.parse_args()
@@ -63,7 +66,8 @@ def main():
     else:
         rows = data.read_jsonl(Path(args.data_dir) / 'validation.jsonl', args.limit, 0)
 
-    result = metrics.evaluate(rows, predict(model, rows, args.batch, args.max_padded_chars))
+    result = metrics.evaluate(rows, predict(model, rows, args.batch,
+                                             max_decision_tokens=args.max_decision_tokens))
     print(json.dumps({k: result[k] for k in ('n', 'score', 'accuracy', 'ece', 'brier', 'nll', 'capabilities')},
                      indent=2))
     if args.out:
