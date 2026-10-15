@@ -77,8 +77,19 @@ locations, first run `source scripts/env.sh && source $VENV/bin/activate`, and p
 | `joint` / `split` | one epoch, effective batch 16 (`$WORK/runs/joint-4b/best`) |
 | `eval_joint` / `eval_split` | the trained head on validation and JEVal |
 
-Settings by GPU memory: on 80 GB use `BATCH=8 ACCUM=2`. On 24 GB use
-`BATCH=2 ACCUM=8 MAX_PADDED_CHARS=24000`. The default (`BATCH=4`) targets 40–48 GB.
+**Throughput settings.** `run_4b.sh` picks a preset from the GPU's memory: on 70 GB or more,
+micro-batch 16 without accumulation and gradient checkpointing off; on 40 GB or more, 8 x 2;
+otherwise 2 x 8 with checkpointing on. The effective batch is always 16. A character cap shrinks
+micro-batches of very long rows, and the biggest batch runs first, so a memory problem shows up
+within seconds. Any of `BATCH`, `ACCUM`, `NO_GRAD_CKPT`, `MAX_BATCH_CHARS`, `EVAL_BATCH` and
+`MAX_PADDED_CHARS` overrides the preset. Batches are tokenized in a background thread while the
+GPU works, the decision pass keeps only the 3 hidden layers it reads, and loss logging doesn't
+force a GPU sync each step.
+
+**Reading the training log.** The raw `ce` swings with batch difficulty. Batches group rows of
+similar length, which tend to come from the same task, and tasks differ a lot in difficulty.
+Watch `gain` instead: CE(teacher, base readout) minus CE(teacher, model) on the same rows. It
+starts at about 0 in joint mode and should rise above 0 as the head learns.
 
 Python 3.10 or newer is required (transformers 5.x). `setup_cuda.sh` uses `$PY` if you set
 it, otherwise the first `python3.12`/`3.11`/`3.10` on PATH, otherwise it creates Python 3.12

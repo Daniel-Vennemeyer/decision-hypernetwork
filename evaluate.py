@@ -16,10 +16,13 @@ from hyperhead import data, metrics
 def predict(model, rows, batch_size=8, max_padded_chars=64000):
     # characters as a length proxy: ~1 token/char for Chinese, ~4 chars/token for English
     length = lambda r: len(data.text(r['state'])) + sum(len(o['desc']) for o in r['options'])
+    from hyperhead.model import prefetch
+
     probs = [None] * len(rows)
-    for batch in data.length_batches(rows, length, batch_size, 0, shuffle=False,
-                                     max_padded=max_padded_chars):
-        logits, _ = model([rows[i] for i in batch])
+    order = data.length_batches(rows, length, batch_size, 0, shuffle=False, max_padded=max_padded_chars)
+    prepared = prefetch(model.prepare, ([rows[i] for i in b] for b in order))
+    for batch, ready in zip(order, prepared):  # next batch is tokenized while this one runs
+        logits, _ = model(ready)
         for i, p in zip(batch, logits.float().softmax(-1).tolist()):
             probs[i] = p[:len(rows[i]['options'])]
     return probs

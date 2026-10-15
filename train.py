@@ -12,7 +12,7 @@ import torch
 
 from evaluate import predict
 from hyperhead import data, metrics
-from hyperhead.model import HyperHead
+from hyperhead.model import HyperHead, prefetch
 from hyperhead.objective import distillation_loss
 
 
@@ -47,6 +47,10 @@ def main():
     ap.add_argument('--eval-rows', type=int, default=1000)
     ap.add_argument('--eval-every', type=int, default=250, help='optimizer steps')
     ap.add_argument('--log-every', type=int, default=10)
+    ap.add_argument('--max-batch-chars', type=int, default=None,
+                    help='caps batch x longest row (characters); long rows get smaller micro-batches')
+    ap.add_argument('--no-grad-ckpt', action='store_true',
+                    help='keep activations instead of recomputing them: faster, more memory')
     ap.add_argument('--max-steps', type=int, default=None, help='stop early, e.g. for a timing run')
     ap.add_argument('--device', default='auto')
     ap.add_argument('--seed', type=int, default=43)
@@ -66,7 +70,8 @@ def main():
     (out / 'args.json').write_text(json.dumps(vars(args), indent=2))
 
     model = HyperHead(args.base, mode=args.mode, rank=args.rank, queries=args.queries,
-                      lora_r=args.lora_r, max_tokens=args.max_tokens, revision=args.revision).to(device)
+                      lora_r=args.lora_r, max_tokens=args.max_tokens, revision=args.revision,
+                      gradient_checkpointing=not args.no_grad_ckpt).to(device)
     train_rows = data.read_jsonl(Path(args.data_dir) / 'train.jsonl', args.train_rows, args.seed)
     val_rows = data.read_jsonl(Path(args.data_dir) / 'validation.jsonl', args.eval_rows, args.seed)
     lora = [p for n, p in model.named_parameters() if p.requires_grad and 'lora_' in n]
@@ -79,17 +84,35 @@ def main():
     length = lambda r: len(r['state']) + len(r['question']) + sum(len(o['desc']) for o in r['options'])
     batches = []
     for epoch in range(math.ceil(args.epochs)):
-        batches += data.length_batches(train_rows, length, args.batch, args.seed + epoch)
-    batches = batches[:int(args.epochs * len(train_rows) / args.batch)]
+        batches += data.length_batches(train_rows, length, args.batch, args.seed + epoch,
+                                       max_padded=args.max_batch_chars)
+    if args.epochs < 1:
+        keep, seen = [], 0
+        for b in batches:
+            if seen >= args.epochs * len(train_rows):
+                break
+            keep.append(b)
+            seen += len(b)
+        batches = keep
+    # run the most memory-hungry micro-batch first, so an out-of-memory error shows up in the
+    # first seconds (e.g. in the timing stage) rather than hours into training
+    biggest = max(range(len(batches)),
+                  key=lambda b: len(batches[b]) * max(length(train_rows[j]) for j in batches[b]))
+    batches.insert(0, batches.pop(biggest))
     total_steps = max(1, len(batches) // args.accum)
     warmup = max(1, int(args.warmup * total_steps))
     schedule = lambda s: min(1.0, (s + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total_steps)))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
 
+    eval_seconds = 0.0
+
     def run_eval(step):
+        nonlocal eval_seconds
+        started = time.time()
         model.eval()
         result = metrics.evaluate(val_rows, predict(model, val_rows, args.batch * 2))
         model.train()
+        eval_seconds += time.time() - started
         summary = {k: result[k] for k in ('score', 'accuracy', 'ece', 'brier', 'nll')}
         print(f'[eval step {step}] ' + '  '.join(f'{k} {v:.4f}' for k, v in summary.items()), flush=True)
         with (out / 'eval.jsonl').open('a') as f:
@@ -99,13 +122,15 @@ def main():
     best = run_eval(0)
     model.save(out / 'best')
     model.train()
-    step, t0, running = 0, time.time(), {}
-    for i, batch in enumerate(batches):
-        rows = [train_rows[j] for j in batch]
-        logits, _ = model(rows)
-        loss, parts = distillation_loss(logits, rows, kappa=args.kappa, gold_weight=args.gold_weight)
+    step, t0, eval_seconds, running, rows_done = 0, time.time(), 0.0, {}, 0
+    batch_rows = ([train_rows[j] for j in b] for b in batches)
+    for i, batch in enumerate(prefetch(model.prepare, batch_rows)):
+        logits, batch = model(batch)
+        loss, parts = distillation_loss(logits, batch['targets'], kappa=args.kappa,
+                                        gold_weight=args.gold_weight)
         (loss / args.accum).backward()
-        for k, v in (parts | {'loss': loss.item()}).items():
+        rows_done += len(batch['n_options'])
+        for k, v in (parts | {'loss': loss.detach()}).items():  # stays on the GPU: no sync per step
             running[k] = running.get(k, 0.0) + v
         if (i + 1) % args.accum:
             continue
@@ -116,11 +141,13 @@ def main():
         step += 1
         if step % args.log_every == 0:
             n = args.log_every * args.accum
-            per_step = (time.time() - t0) / step
+            train_seconds = time.time() - t0 - eval_seconds  # training time only
+            per_step = train_seconds / step
             memory = (f' peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB'
                       if device.type == 'cuda' else '')
-            print(f'step {step}/{total_steps} ' + ' '.join(f'{k} {v/n:.4f}' for k, v in running.items())
+            print(f'step {step}/{total_steps} ' + ' '.join(f'{k} {float(v)/n:.4f}' for k, v in running.items())
                   + f' lr {scheduler.get_last_lr()[0]:.2e} {per_step:.2f}s/step'
+                  + f' {rows_done / train_seconds:.1f} rows/s'
                   + f' eta {(total_steps - step) * per_step / 3600:.2f}h{memory}', flush=True)
             running = {}
         if args.max_steps and step >= args.max_steps:

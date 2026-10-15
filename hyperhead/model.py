@@ -26,6 +26,30 @@ from torch import nn
 from . import data
 
 
+def _map_tensors(value, fn):
+    if isinstance(value, torch.Tensor):
+        return fn(value)
+    if isinstance(value, dict):
+        return {k: _map_tensors(v, fn) for k, v in value.items()}
+    return value
+
+
+def prefetch(prepare, batches):
+    """Yields prepare(b) for each b, preparing the next batch in a background thread."""
+    from concurrent.futures import ThreadPoolExecutor
+    batches = iter(batches)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = next(batches, None)
+        if first is None:
+            return
+        pending = pool.submit(prepare, first)
+        for upcoming in batches:
+            ready = pending.result()
+            pending = pool.submit(prepare, upcoming)
+            yield ready
+        yield pending.result()
+
+
 def _mlp(d_in, d_hidden, d_out, zero_last=False):
     last = nn.Linear(d_hidden, d_out)
     if zero_last:
@@ -112,27 +136,6 @@ class HyperHead(nn.Module):
     def _last(hidden, mask):
         return hidden[torch.arange(len(hidden), device=hidden.device), mask.sum(-1) - 1]
 
-    # ------------------------------------------------------------------ passes
-    def generate_heads(self, rows):
-        """Hypernetwork pass (LoRA on). Depends only on question + options, so it can be cached."""
-        texts, spans = zip(*(data.spec_prompt(self.tokenizer, r) for r in rows))
-        enc = self._encode(list(texts), offsets=True)
-        offsets = enc.pop('offset_mapping')
-        enc = enc.to(self.device)
-        hidden = self._text_model()(**enc, use_cache=False).last_hidden_state.float()
-        k_max = max(len(s) for s in spans)
-        pool = torch.zeros(len(rows), k_max, hidden.shape[1])
-        for i, row_spans in enumerate(spans):
-            start, end = offsets[i, :, 0], offsets[i, :, 1]
-            for k, (a, b) in enumerate(row_spans):
-                inside = (start >= a) & (end <= b) & (end > start)
-                if not inside.any():  # option truncated away: fall back to the last token
-                    inside[enc['attention_mask'][i].sum() - 1] = True
-                pool[i, k] = inside.float() / inside.sum()
-        option_emb = torch.einsum('bkt,btd->bkd', pool.to(hidden), hidden)
-        spec_emb = self._last(hidden, enc['attention_mask'])
-        return self.generator(option_emb, spec_emb)
-
     def _clip(self, row, reserve=768):
         """Shortens an over-long state so the prompt's answer cue is never truncated away."""
         ids = self.tokenizer.encode(data.text(row['state']), add_special_tokens=False)
@@ -141,27 +144,78 @@ class HyperHead(nn.Module):
             return row
         return row | {'state': self.tokenizer.decode(ids[:budget]) + ' ...'}
 
-    @torch.no_grad()
-    def read_states(self, rows):
-        """Decision pass with the original weights (LoRA off). Returns reader inputs and, in joint
-        mode, the frozen answer-slot logits over the lettered options."""
-        rows = [self._clip(r) for r in rows]
+    # ------------------------------------------------------------------ CPU side
+    def prepare(self, rows):
+        """All CPU work for a batch: prompts, tokenization, option-pooling masks, targets.
+        Thread-safe with respect to the GPU passes, so the next batch can be prepared in a
+        background thread while the current one runs (see prefetch())."""
+        from .objective import targets
+
+        texts, spans = zip(*(data.spec_prompt(self.tokenizer, r) for r in rows))
+        spec = self._encode(list(texts), offsets=True)
+        offsets = spec.pop('offset_mapping')
+        lengths = spec['attention_mask'].sum(-1)
+        k_max = max(len(s) for s in spans)
+        pool = torch.zeros(len(rows), k_max, spec['input_ids'].shape[1])
+        for i, row_spans in enumerate(spans):
+            start, end = offsets[i, :, 0], offsets[i, :, 1]
+            for k, (a, b) in enumerate(row_spans):
+                inside = (start >= a) & (end <= b) & (end > start)
+                if not inside.any():  # option truncated away: fall back to the last token
+                    inside[lengths[i] - 1] = True
+                pool[i, k] = inside.float() / inside.sum()
+
+        clipped = [self._clip(r) for r in rows]
         if self.mode == 'joint':
-            texts = [data.joint_prompt(self.tokenizer, r, self.labels) for r in rows]
+            decision_texts = [data.joint_prompt(self.tokenizer, r, self.labels) for r in clipped]
         else:
-            texts = [data.state_prompt(self.tokenizer, r) for r in rows]
-        enc = self._encode(texts).to(self.device)
-        with self.lm.disable_adapter():
-            out = self._text_model()(**enc, use_cache=False, output_hidden_states=True)
+            decision_texts = [data.state_prompt(self.tokenizer, r) for r in clipped]
+        decision = self._encode(decision_texts)
+        batch = dict(spec=dict(spec), pool=pool, decision=dict(decision),
+                     n_options=torch.tensor([len(r['options']) for r in rows]), k_max=k_max,
+                     targets=targets(rows, k_max))
+        if torch.cuda.is_available():  # pinned memory -> asynchronous host-to-device copies
+            batch = _map_tensors(batch, lambda t: t.pin_memory())
+        return batch
+
+    def to_device(self, batch):
+        return _map_tensors(batch, lambda t: t.to(self.device, non_blocking=True))
+
+    # ------------------------------------------------------------------ GPU passes
+    def generate_heads(self, batch):
+        """Hypernetwork pass (LoRA on). Depends only on question + options, so it can be cached."""
+        spec = batch['spec']
+        hidden = self._text_model()(**spec, use_cache=False).last_hidden_state.float()
+        option_emb = torch.einsum('bkt,btd->bkd', batch['pool'], hidden)
+        spec_emb = self._last(hidden, spec['attention_mask'])
+        return self.generator(option_emb, spec_emb)
+
+    @torch.no_grad()
+    def read_states(self, batch):
+        """Decision pass with the original weights (LoRA off). Returns reader inputs and, in joint
+        mode, the frozen answer-slot logits over the lettered options. Only the read layers are
+        kept (forward hooks), not all hidden states."""
+        enc = batch['decision']
+        model = self._text_model()
+        n_layers = len(model.layers)
+        captured = {}
+        hooks = [model.layers[i - 1].register_forward_hook(
+                     lambda _m, _i, out, i=i: captured.__setitem__(i, out[0] if isinstance(out, tuple) else out))
+                 for i in self.read_layers if i < n_layers]
+        try:
+            with self.lm.disable_adapter():
+                out = model(**enc, use_cache=False)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        captured[n_layers] = out.last_hidden_state  # == hidden_states[n_layers] (post-norm)
         mask = enc['attention_mask'].bool()
-        # padded positions can hold huge values (linear-attention layers); they would overflow
-        # the reader's LayerNorm statistics and its gradients, so zero them.
-        states = torch.cat([out.hidden_states[i] for i in self.read_layers], -1).float()
+        # zero padded positions so they cannot disturb the reader's normalisation
+        states = torch.cat([captured[i] for i in self.read_layers], -1).float()
         states = states.masked_fill(~mask[..., None], 0.0)
         base = None
         if self.mode == 'joint':
-            k_max = max(len(r['options']) for r in rows)
-            weight = self.lm.get_base_model().get_output_embeddings().weight[self.label_ids[:k_max]]
+            weight = self.lm.get_base_model().get_output_embeddings().weight[self.label_ids[:batch['k_max']]]
             base = F.linear(self._last(out.last_hidden_state, mask), weight).float()
         return dict(states=states, mask=mask, base=base)
 
@@ -171,12 +225,15 @@ class HyperHead(nn.Module):
             logits = logits + read['base']
         return logits
 
-    def forward(self, rows):
-        read = self.read_states(rows)
-        logits = self.decide(self.generate_heads(rows), read)
-        n = torch.tensor([len(r['options']) for r in rows], device=logits.device)
-        invalid = torch.arange(logits.shape[-1], device=logits.device)[None] >= n[:, None]
-        return logits.masked_fill(invalid, -1e9), read['base']
+    def forward(self, batch):
+        """batch: rows (list of dicts) or the output of prepare()."""
+        if isinstance(batch, list):
+            batch = self.prepare(batch)
+        batch = self.to_device(batch)
+        read = self.read_states(batch)
+        logits = self.decide(self.generate_heads(batch), read)
+        invalid = torch.arange(logits.shape[-1], device=logits.device)[None] >= batch['n_options'][:, None]
+        return logits.masked_fill(invalid, -1e9), batch
 
     # ------------------------------------------------------------------ io
     def trainable_state(self):

@@ -11,31 +11,48 @@ import torch
 TYPE_WEIGHTS = {'choice': 1.0, 'noul': 1.1666667, 'score': 0.8}
 
 
-def _pad(rows, field, width, device):
-    out = torch.zeros(len(rows), width, device=device)
+def _pad(rows, field, width):
+    out = torch.zeros(len(rows), width)
     for i, row in enumerate(rows):
         values = row.get(field)
         if values is not None:
-            out[i, :len(values)] = torch.tensor(values, device=device)
+            out[i, :len(values)] = torch.tensor(values)
     return out
 
 
-def distillation_loss(logits, rows, kappa=0.05, kappa_hard_noul=0.2, gold_weight=0.0):
-    device, width = logits.device, logits.shape[-1]
+def targets(rows, width):
+    """CPU tensors for one batch (built in HyperHead.prepare, moved to the GPU in one go)."""
+    return dict(
+        teacher=_pad(rows, 'train_target', width),
+        gold=_pad(rows, 'gold_target', width),
+        p0=_pad(rows, 'p0', width),
+        n=torch.tensor([len(r['options']) for r in rows], dtype=torch.float),
+        weight=torch.tensor([TYPE_WEIGHTS[r['type']] for r in rows]),
+        is_score=torch.tensor([float(r['type'] == 'score') for r in rows]),
+        hard_noul=torch.tensor([r['type'] == 'noul' and max(r['gold_target']) >= 1 - 1e-6 for r in rows]),
+    )
+
+
+def distillation_loss(logits, t, kappa=0.05, kappa_hard_noul=0.2, gold_weight=0.0):
+    """t: targets(...) on the logits' device. Returns (loss, parts); parts are detached GPU
+    tensors so logging does not force a GPU sync every step.
+
+    parts['gain'] = CE(teacher, p0) - CE(teacher, p): how much closer to the teacher than the base
+    model's own no-thinking readout, on the same rows. 0 at the start of joint training,
+    positive = learning. Unlike the raw CE it does not swing with batch difficulty."""
     logp = logits.float().log_softmax(-1)
-    teacher = _pad(rows, 'train_target', width, device)
+    teacher = t['teacher']
     if gold_weight:
-        teacher = (1 - gold_weight) * teacher + gold_weight * _pad(rows, 'gold_target', width, device)
-    p0 = _pad(rows, 'p0', width, device)
-    n = torch.tensor([len(r['options']) for r in rows], device=device, dtype=torch.float)
-    weight = torch.tensor([TYPE_WEIGHTS[r['type']] for r in rows], device=device)
-    is_score = torch.tensor([r['type'] == 'score' for r in rows], device=device, dtype=torch.float)
-    levels = torch.arange(width, device=device, dtype=torch.float)
+        teacher = (1 - gold_weight) * teacher + gold_weight * t['gold']
+    levels = torch.arange(logits.shape[-1], device=logits.device, dtype=torch.float)
 
     ce = -(teacher * logp).sum(-1)
-    ordinal = 0.5 * is_score * (((logp.exp() - teacher) * levels).sum(-1) / (n - 1).clamp_min(1)).square()
-    k = torch.tensor([kappa_hard_noul if r['type'] == 'noul' and max(r['gold_target']) >= 1 - 1e-6
-                      else kappa for r in rows], device=device)
+    ordinal = 0.5 * t['is_score'] * (((logp.exp() - teacher) * levels).sum(-1)
+                                     / (t['n'] - 1).clamp_min(1)).square()
+    k = torch.where(t['hard_noul'], torch.full_like(ce, kappa_hard_noul), torch.full_like(ce, kappa))
+    p0 = t['p0']
     kl = k * (p0 * (p0.clamp_min(1e-30).log() - logp)).sum(-1)
-    total = weight * (ce + ordinal) + kl
-    return total.mean(), dict(ce=ce.mean().item(), ordinal=ordinal.mean().item(), kl=kl.mean().item())
+    total = t['weight'] * (ce + ordinal) + kl
+    ce_p0 = -(teacher * p0.clamp_min(1e-30).log()).sum(-1)
+    parts = dict(ce=ce.mean(), ordinal=ordinal.mean(), kl=kl.mean(), gain=(ce_p0 - ce).mean())
+    return total.mean(), {name: value.detach() for name, value in parts.items()}
