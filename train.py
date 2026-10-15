@@ -57,9 +57,10 @@ def main():
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True  # the head generator runs in fp32
         from transformers.models.qwen3_5 import modeling_qwen3_5
-        if not modeling_qwen3_5.is_fast_path_available:
-            print('WARNING: flash-linear-attention / causal-conv1d not found; Qwen3.5 linear-attention '
-                  'layers will use the slow torch fallback (see scripts/setup_cuda.sh).', flush=True)
+        # fla carries the cost; causal-conv1d is optional (torch conv1d fallback is cheap)
+        if modeling_qwen3_5.chunk_gated_delta_rule is None:
+            print('WARNING: flash-linear-attention not found; Qwen3.5 linear-attention layers will use '
+                  'the slow torch fallback (see scripts/setup_cuda.sh).', flush=True)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / 'args.json').write_text(json.dumps(vars(args), indent=2))

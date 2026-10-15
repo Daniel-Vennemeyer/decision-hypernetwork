@@ -38,19 +38,42 @@ pip install -U pip wheel packaging ninja
 pip install "torch>=2.7"                       # PyPI Linux wheels ship with CUDA 12.x
 pip install -r requirements.txt huggingface_hub
 
-# 2. fast linear-attention kernels for Qwen3.5's Gated DeltaNet layers --------------------------
-#    flash-linear-attention is Triton (pure pip). causal-conv1d fetches a prebuilt wheel matching
-#    your torch/CUDA when one exists; otherwise it compiles, which needs nvcc (CUDA toolkit).
+# 2. fast kernels for Qwen3.5's Gated DeltaNet layers -------------------------------------------
+#    Required: flash-linear-attention (Triton, pure pip). It replaces the expensive part, the
+#    chunked gated delta rule.
+#    Optional: causal-conv1d. It only replaces a short depthwise conv; without it transformers
+#    uses torch's conv1d at a small cost. It has prebuilt wheels only for some torch/CUDA
+#    combinations and otherwise compiles, which fails when the system nvcc differs from torch's
+#    CUDA (e.g. nvcc 12.0 vs a CUDA 13.0 torch). So it is best-effort; INSTALL_CAUSAL_CONV1D=0 skips it.
 pip install "flash-linear-attention>=0.2.2"
-pip install causal-conv1d --no-build-isolation
+if [ "${INSTALL_CAUSAL_CONV1D:-1}" = 1 ]; then
+  pip install causal-conv1d --no-build-isolation \
+    || echo "NOTE: causal-conv1d did not install; continuing with torch conv1d (minor slowdown)."
+fi
 
+# check the fla kernel on the GPU: forward + backward against transformers' torch reference
 python - <<'EOF'
 import torch
 from transformers.models.qwen3_5 import modeling_qwen3_5 as m
 assert torch.cuda.is_available(), 'CUDA not visible to torch'
-print('GPU:', torch.cuda.get_device_name(0), f'{torch.cuda.get_device_properties(0).total_memory/2**30:.0f} GiB')
-print('Qwen3.5 fast path:', m.is_fast_path_available)
-assert m.is_fast_path_available, 'fla / causal-conv1d kernels not importable; training would be very slow'
+print('GPU:', torch.cuda.get_device_name(0), f'{torch.cuda.get_device_properties(0).total_memory/2**30:.0f} GiB',
+      '| torch', torch.__version__, 'CUDA', torch.version.cuda)
+print('causal-conv1d:', 'yes' if m.causal_conv1d_fn is not None else 'no (torch conv1d fallback)')
+assert m.chunk_gated_delta_rule is not None, 'flash-linear-attention not importable; training would be very slow'
+
+torch.manual_seed(0)
+B, T, H, D = 2, 200, 4, 64
+q, k, v = (torch.randn(B, T, H, D, device='cuda', dtype=torch.bfloat16, requires_grad=True) for _ in range(3))
+g = -torch.rand(B, T, H, device='cuda').mul(0.5)
+beta = torch.rand(B, T, H, device='cuda', dtype=torch.bfloat16).sigmoid()
+out, _ = m.chunk_gated_delta_rule(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
+out.float().pow(2).sum().backward()
+ref, _ = m.torch_chunk_gated_delta_rule(q.detach(), k.detach(), v.detach(), g=g, beta=beta,
+                                        use_qk_l2norm_in_kernel=True)
+err = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
+grads_ok = all(t.grad is not None and torch.isfinite(t.grad).all() for t in (q, k, v))
+print(f'fla gated delta rule: relative max error vs torch reference {err:.2e}, gradients finite: {grads_ok}')
+assert err < 5e-2 and grads_ok, 'fla kernel output looks wrong on this GPU'
 EOF
 
 # 3. data (~100 MB) -----------------------------------------------------------------------------

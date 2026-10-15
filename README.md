@@ -84,9 +84,13 @@ Python 3.10 or newer is required (transformers 5.x). `setup_cuda.sh` uses `$PY` 
 it, otherwise the first `python3.12`/`3.11`/`3.10` on PATH, otherwise it creates Python 3.12
 with conda in `$WORK/.python`. An existing `.venv` built on an older Python is rebuilt.
 
-If `setup_cuda.sh` fails at causal-conv1d, there was no prebuilt wheel for your torch/CUDA
-combination. Install the CUDA toolkit (nvcc) and rerun, or install a torch version with a
-matching wheel.
+Of the two Qwen3.5 kernel packages, only flash-linear-attention is required: it runs the
+expensive gated delta rule, and setup checks it on the GPU against the torch reference
+(forward and backward). causal-conv1d is optional. It only replaces a short convolution, and
+without it transformers uses torch's conv1d. It ships prebuilt wheels for only some torch/CUDA
+combinations; elsewhere it compiles, which fails when the system nvcc differs from torch's CUDA
+(e.g. nvcc 12.0 vs PyPI's CUDA 13.0 torch). Setup then prints a note and continues.
+`INSTALL_CAUSAL_CONV1D=0` skips it.
 
 ### Expected time
 
@@ -106,8 +110,8 @@ These are estimates from FLOP counts on the measured token totals, not measureme
 | A100 80 GB | ~1.5–2.5 h | ~45–75 min | ~4–5 h |
 | L40S / RTX 4090 | ~3–5 h | ~1.5–2 h | ~7–9 h |
 
-`split` training costs about 80% of `joint`. Without the fla/causal-conv1d kernels, everything
-is several times slower; `train.py` prints a warning in that case.
+`split` training costs about 80% of `joint`. Without flash-linear-attention, everything is several times
+slower; `train.py` prints a warning in that case.
 
 ## Run locally (CPU / Apple Silicon)
 
