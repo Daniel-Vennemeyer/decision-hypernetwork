@@ -42,19 +42,31 @@ The teacher targets come from Qwen3.5-4B. With any other base, they are off-poli
 ## Run on a single CUDA GPU
 
 ```bash
-git clone https://github.com/Daniel-Vennemeyer/decision-hypernetwork.git /data/jiang/vennemdp/decision-hypernetwork
-cd /data/jiang/vennemdp/decision-hypernetwork
+git clone https://github.com/Daniel-Vennemeyer/decision-hypernetwork.git ~/decision-hypernetwork
+cd ~/decision-hypernetwork
 bash scripts/setup_cuda.sh   # venv, torch, fla + causal-conv1d kernels (checked), data, weights
 tmux new -s hyperhead        # the run takes hours
 bash scripts/run_4b.sh       # timing -> baseline eval -> joint training -> eval
 ```
 
-Everything the scripts write goes under `$WORK`, which defaults to
-`/data/jiang/vennemdp/decision-hypernetwork` (set in `scripts/env.sh`; override with
-`WORK=/other/dir`). That covers the Python environment (`.venv`), the pip, Hugging Face (~9 GB
-of weights), Triton and inductor caches (`.cache/`), temporary files (`tmp/`), data (`data/`),
-checkpoints and results (`runs/`) and logs (`logs/`), so nothing lands in your home directory.
-If the repo is cloned into `$WORK` as above, those directories are git-ignored.
+The repo (code only) lives in `~/`. Everything the scripts write goes under `$WORK`, which
+defaults to `/data/jiang/vennemdp/decision-hypernetwork` (set in `scripts/env.sh`; override with
+`WORK=/other/dir`):
+
+| `$WORK/...` | contents |
+|---|---|
+| `.venv/` | Python environment |
+| `.cache/huggingface/` | Qwen3.5-4B weights (~9 GB) |
+| `.cache/` (pip, triton, inductor, torch, nv, pycache) | tool caches, including `__pycache__` |
+| `tmp/` | temporary files |
+| `data/` | SII-Decision training data, JEVal |
+| `runs/` | checkpoints (`<run>/best`, `<run>/last`), `eval.jsonl`, result JSONs |
+| `logs/` | one log per stage |
+
+The scripts redirect every cache they know of there, so nothing should land in the repo or
+elsewhere in your home directory. To run `train.py` or `evaluate.py` by hand with the same
+locations, first run `source scripts/env.sh && source $VENV/bin/activate`, and pass
+`--data-dir $DATA_DIR --out $RUNS_DIR/...`.
 
 `scripts/run_4b.sh` runs stages in order (choose them with `STAGES=...`):
 
