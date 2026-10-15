@@ -1,5 +1,6 @@
 torch>=2.6
-transformers>=5.7
-peft>=0.19
+# pinned: the versions the code was developed and tested with
+transformers==5.7.0
+peft==0.19.1
 pandas
 pyarrow

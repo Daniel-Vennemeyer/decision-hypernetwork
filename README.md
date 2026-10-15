@@ -89,7 +89,8 @@ run. Setup reads the driver's CUDA version from `nvidia-smi` and installs a matc
 download.pytorch.org: cu130 for 13.x, cu128 for 12.8+, and cu126 for 12.0–12.7 (CUDA minor-version
 compatibility). With a 12.4–12.5 driver it falls back to torch 2.6.0 + cu124 if the GPU check
 fails. Override with `TORCH_CUDA=cu124` (or cu126, cu128, ...). A torch built for a different
-CUDA version is replaced. Rerun the check alone with `python scripts/check_gpu.py`.
+CUDA version is replaced. Rerun the check alone with `python scripts/check_gpu.py`. transformers and peft are pinned
+to the tested versions (5.7.0 / 0.19.1). Newer transformers releases move Qwen3.5 internals.
 
 **Kernels.** Of the two Qwen3.5 kernel packages, only flash-linear-attention is required. It
 runs the expensive gated delta rule, and setup checks it on the GPU against the torch reference
