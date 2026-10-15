@@ -35,48 +35,62 @@ fi
 if [ ! -d "$VENV" ]; then "$PY" -m venv "$VENV"; fi
 source "$VENV/bin/activate"
 pip install -U pip wheel packaging ninja
-pip install "torch>=2.7"                       # PyPI Linux wheels ship with CUDA 12.x
-pip install -r requirements.txt huggingface_hub
 
-# 2. fast kernels for Qwen3.5's Gated DeltaNet layers -------------------------------------------
+# 2. torch built for a CUDA version the NVIDIA driver supports -----------------------------------
+#    PyPI's default torch targets the newest CUDA (13.0), which older drivers cannot run. Read the
+#    driver's CUDA version from nvidia-smi and pick a matching build from download.pytorch.org:
+#      driver >= 13.0 -> cu130 | 12.8-12.9 -> cu128 | 12.0-12.7 -> cu126 (via CUDA minor-version
+#      compatibility; if the GPU check fails, setup falls back to torch 2.6.0 + cu124 for 12.4+).
+#    Override with TORCH_CUDA=cu124 (or cu126, cu128, ...).
+driver_cuda=$(nvidia-smi 2>/dev/null | grep -o 'CUDA Version: [0-9.]*' | awk '{print $3}' || true)
+[ -n "$driver_cuda" ] || { echo "nvidia-smi did not report a CUDA version; is an NVIDIA driver installed?"; exit 1; }
+if [ -z "${TORCH_CUDA:-}" ]; then
+  case $driver_cuda in
+    1[3-9].*) TORCH_CUDA=cu130 ;;
+    12.[89]*) TORCH_CUDA=cu128 ;;
+    12.*)     TORCH_CUDA=cu126 ;;
+    *) echo "driver CUDA $driver_cuda is too old for current torch; update the driver"; exit 1 ;;
+  esac
+  AUTO_TORCH=1
+fi
+echo "driver supports CUDA $driver_cuda -> torch build $TORCH_CUDA"
+
+install_torch() {  # $1 = cu126 etc.; replaces torch (and its triton) unless already that build
+  local have
+  have=$(python -c 'import torch; print("cu" + torch.version.cuda.replace(".", ""))' 2>/dev/null || true)
+  if [ "$have" = "$1" ]; then echo "torch already built for $1"; return; fi
+  pip uninstall -y torch triton pytorch-triton causal-conv1d >/dev/null 2>&1 || true
+  pip install torch --index-url "https://download.pytorch.org/whl/$1"
+}
+install_torch "$TORCH_CUDA"
+pip install -r requirements.txt huggingface_hub   # torch is already satisfied, so it stays as is
+
+# 3. fast kernels for Qwen3.5's Gated DeltaNet layers -------------------------------------------
 #    Required: flash-linear-attention (Triton, pure pip). It replaces the expensive part, the
 #    chunked gated delta rule.
 #    Optional: causal-conv1d. It only replaces a short depthwise conv; without it transformers
-#    uses torch's conv1d at a small cost. It has prebuilt wheels only for some torch/CUDA
-#    combinations and otherwise compiles, which fails when the system nvcc differs from torch's
-#    CUDA (e.g. nvcc 12.0 vs a CUDA 13.0 torch). So it is best-effort; INSTALL_CAUSAL_CONV1D=0 skips it.
+#    uses torch's conv1d at a small cost. Without a prebuilt wheel for your torch/CUDA it compiles
+#    (slow, needs an nvcc matching torch's CUDA major version), so it is off by default;
+#    INSTALL_CAUSAL_CONV1D=1 tries it.
 pip install "flash-linear-attention>=0.2.2"
-if [ "${INSTALL_CAUSAL_CONV1D:-1}" = 1 ]; then
+if [ "${INSTALL_CAUSAL_CONV1D:-0}" = 1 ]; then
   pip install causal-conv1d --no-build-isolation \
     || echo "NOTE: causal-conv1d did not install; continuing with torch conv1d (minor slowdown)."
 fi
 
-# check the fla kernel on the GPU: forward + backward against transformers' torch reference
-python - <<'EOF'
-import torch
-from transformers.models.qwen3_5 import modeling_qwen3_5 as m
-assert torch.cuda.is_available(), 'CUDA not visible to torch'
-print('GPU:', torch.cuda.get_device_name(0), f'{torch.cuda.get_device_properties(0).total_memory/2**30:.0f} GiB',
-      '| torch', torch.__version__, 'CUDA', torch.version.cuda)
-print('causal-conv1d:', 'yes' if m.causal_conv1d_fn is not None else 'no (torch conv1d fallback)')
-assert m.chunk_gated_delta_rule is not None, 'flash-linear-attention not importable; training would be very slow'
+# GPU check (torch sees the GPU; fla kernel forward + backward matches the torch reference)
+if ! python scripts/check_gpu.py; then
+  if [ "${AUTO_TORCH:-0}" = 1 ] && [ "$TORCH_CUDA" = cu126 ] && \
+     awk -v v="$driver_cuda" 'BEGIN { exit !(v >= 12.4 && v < 12.6) }'; then
+    echo "GPU check failed with cu126 on a CUDA $driver_cuda driver; falling back to torch 2.6.0 + cu124"
+    install_torch cu124
+    python scripts/check_gpu.py || { echo "GPU check failed again; paste the output above"; exit 1; }
+  else
+    echo "GPU check failed; paste the output above"; exit 1
+  fi
+fi
 
-torch.manual_seed(0)
-B, T, H, D = 2, 200, 4, 64
-q, k, v = (torch.randn(B, T, H, D, device='cuda', dtype=torch.bfloat16, requires_grad=True) for _ in range(3))
-g = -torch.rand(B, T, H, device='cuda').mul(0.5)
-beta = torch.rand(B, T, H, device='cuda', dtype=torch.bfloat16).sigmoid()
-out, _ = m.chunk_gated_delta_rule(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
-out.float().pow(2).sum().backward()
-ref, _ = m.torch_chunk_gated_delta_rule(q.detach(), k.detach(), v.detach(), g=g, beta=beta,
-                                        use_qk_l2norm_in_kernel=True)
-err = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
-grads_ok = all(t.grad is not None and torch.isfinite(t.grad).all() for t in (q, k, v))
-print(f'fla gated delta rule: relative max error vs torch reference {err:.2e}, gradients finite: {grads_ok}')
-assert err < 5e-2 and grads_ok, 'fla kernel output looks wrong on this GPU'
-EOF
-
-# 3. data (~100 MB) -----------------------------------------------------------------------------
+# 4. data (~100 MB) -----------------------------------------------------------------------------
 for f in train.jsonl validation.jsonl; do
   [ -f "$DATA_DIR/$f" ] || curl -L --fail -o "$DATA_DIR/$f" \
     https://huggingface.co/datasets/jylin001206/SII-Decision-4B-Training-Data/resolve/main/$f
@@ -85,7 +99,7 @@ done
   https://huggingface.co/datasets/carlosxiang/JEVal/resolve/main/data/test.parquet
 wc -l "$DATA_DIR"/*.jsonl
 
-# 4. weights (~9 GB, into $HF_HOME) ---------------------------------------------------------------
+# 5. weights (~9 GB, into $HF_HOME) ---------------------------------------------------------------
 python -c "from huggingface_hub import snapshot_download as s; print(s('Qwen/Qwen3.5-4B', revision='$REVISION'))"
 du -sh "$WORK"
 echo "setup done. next: bash scripts/run_4b.sh"

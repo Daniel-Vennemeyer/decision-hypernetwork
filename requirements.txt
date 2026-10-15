@@ -1,4 +1,4 @@
-torch>=2.7
+torch>=2.6
 transformers>=5.7
 peft>=0.19
 pandas
