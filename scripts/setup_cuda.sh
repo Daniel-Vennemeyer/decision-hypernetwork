@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # One-time setup on a single-GPU Linux CUDA machine: environment, fast Qwen3.5 kernels, data, weights.
+# Everything is written under $WORK (default /data/jiang/vennemdp/decision-hypernetwork, see env.sh).
 #   bash scripts/setup_cuda.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/env.sh
+echo "WORK=$WORK"
 
 PY=${PY:-python3}
 REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a   # Qwen3.5-4B revision used by SII-Decision
 
 # 1. environment ------------------------------------------------------------------------------
-if [ ! -d .venv ]; then $PY -m venv .venv; fi
-source .venv/bin/activate
+if [ ! -d "$VENV" ]; then $PY -m venv "$VENV"; fi
+source "$VENV/bin/activate"
 pip install -U pip wheel packaging ninja
 pip install "torch>=2.7"                       # PyPI Linux wheels ship with CUDA 12.x
 pip install -r requirements.txt huggingface_hub
@@ -30,15 +33,15 @@ assert m.is_fast_path_available, 'fla / causal-conv1d kernels not importable; tr
 EOF
 
 # 3. data (~100 MB) -----------------------------------------------------------------------------
-mkdir -p data
 for f in train.jsonl validation.jsonl; do
-  [ -f data/$f ] || curl -L --fail -o data/$f \
+  [ -f "$DATA_DIR/$f" ] || curl -L --fail -o "$DATA_DIR/$f" \
     https://huggingface.co/datasets/jylin001206/SII-Decision-4B-Training-Data/resolve/main/$f
 done
-[ -f data/jeval_test.parquet ] || curl -L --fail -o data/jeval_test.parquet \
+[ -f "$DATA_DIR/jeval_test.parquet" ] || curl -L --fail -o "$DATA_DIR/jeval_test.parquet" \
   https://huggingface.co/datasets/carlosxiang/JEVal/resolve/main/data/test.parquet
-wc -l data/*.jsonl
+wc -l "$DATA_DIR"/*.jsonl
 
-# 4. weights (~9 GB) ----------------------------------------------------------------------------
+# 4. weights (~9 GB, into $HF_HOME) ---------------------------------------------------------------
 python -c "from huggingface_hub import snapshot_download as s; print(s('Qwen/Qwen3.5-4B', revision='$REVISION'))"
+du -sh "$WORK"
 echo "setup done. next: bash scripts/run_4b.sh"

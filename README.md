@@ -42,18 +42,27 @@ The teacher targets come from Qwen3.5-4B. With any other base, they are off-poli
 ## Run on a single CUDA GPU
 
 ```bash
+git clone https://github.com/Daniel-Vennemeyer/decision-hypernetwork.git /data/jiang/vennemdp/decision-hypernetwork
+cd /data/jiang/vennemdp/decision-hypernetwork
 bash scripts/setup_cuda.sh   # venv, torch, fla + causal-conv1d kernels (checked), data, weights
 tmux new -s hyperhead        # the run takes hours
 bash scripts/run_4b.sh       # timing -> baseline eval -> joint training -> eval
 ```
+
+Everything the scripts write goes under `$WORK`, which defaults to
+`/data/jiang/vennemdp/decision-hypernetwork` (set in `scripts/env.sh`; override with
+`WORK=/other/dir`). That covers the Python environment (`.venv`), the pip, Hugging Face (~9 GB
+of weights), Triton and inductor caches (`.cache/`), temporary files (`tmp/`), data (`data/`),
+checkpoints and results (`runs/`) and logs (`logs/`), so nothing lands in your home directory.
+If the repo is cloned into `$WORK` as above, those directories are git-ignored.
 
 `scripts/run_4b.sh` runs stages in order (choose them with `STAGES=...`):
 
 | stage | what it does |
 |---|---|
 | `timing` | 40 optimizer steps; logs s/step, the ETA for a full epoch, and peak GPU memory |
-| `baseline` | frozen base readout on SII validation and JEVal (`runs/base-*.json`) |
-| `joint` / `split` | one epoch, effective batch 16 (`runs/joint-4b/best`) |
+| `baseline` | frozen base readout on SII validation and JEVal (`$WORK/runs/base-*.json`) |
+| `joint` / `split` | one epoch, effective batch 16 (`$WORK/runs/joint-4b/best`) |
 | `eval_joint` / `eval_split` | the trained head on validation and JEVal |
 
 Settings by GPU memory: on 80 GB use `BATCH=8 ACCUM=2`. On 24 GB use
