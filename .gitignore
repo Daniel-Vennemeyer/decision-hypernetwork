@@ -1,0 +1,10 @@
+# downloaded by scripts/setup_cuda.sh
+data/
+# training outputs
+runs/
+logs/
+*.pt
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

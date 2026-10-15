@@ -1,0 +1,5 @@
+torch>=2.7
+transformers>=5.7
+peft>=0.19
+pandas
+pyarrow
