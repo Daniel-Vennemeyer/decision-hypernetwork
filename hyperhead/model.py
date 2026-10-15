@@ -161,35 +161,37 @@ class HyperHead(nn.Module):
                 out.extend(min(len(x), self.max_tokens) for x in ids)
         return spec, decision
 
-    def prepare(self, rows):
+    def prepare(self, rows, spec=True, decision=True):
         """All CPU work for a batch: prompts, tokenization, option-pooling masks, targets.
         Thread-safe with respect to the GPU passes, so the next batch can be prepared in a
-        background thread while the current one runs (see prefetch())."""
+        background thread while the current one runs (see prefetch()). spec / decision select
+        which pass to prepare (evaluation prepares them separately to cache heads per spec)."""
         from .objective import targets
 
-        texts, spans = zip(*(data.spec_prompt(self.tokenizer, r) for r in rows))
-        spec = self._encode(list(texts), offsets=True)
-        offsets = spec.pop('offset_mapping')
-        lengths = spec['attention_mask'].sum(-1)
-        k_max = max(len(s) for s in spans)
-        pool = torch.zeros(len(rows), k_max, spec['input_ids'].shape[1])
-        for i, row_spans in enumerate(spans):
-            start, end = offsets[i, :, 0], offsets[i, :, 1]
-            for k, (a, b) in enumerate(row_spans):
-                inside = (start >= a) & (end <= b) & (end > start)
-                if not inside.any():  # option truncated away: fall back to the last token
-                    inside[lengths[i] - 1] = True
-                pool[i, k] = inside.float() / inside.sum()
-
-        clipped = [self._clip(r) for r in rows]
-        if self.mode == 'joint':
-            decision_texts = [data.joint_prompt(self.tokenizer, r, self.labels) for r in clipped]
-        else:
-            decision_texts = [data.state_prompt(self.tokenizer, r) for r in clipped]
-        decision = self._encode(decision_texts)
-        batch = dict(spec=dict(spec), pool=pool, decision=dict(decision),
-                     n_options=torch.tensor([len(r['options']) for r in rows]), k_max=k_max,
+        k_max = max(len(r['options']) for r in rows)
+        batch = dict(n_options=torch.tensor([len(r['options']) for r in rows]), k_max=k_max,
                      targets=targets(rows, k_max))
+        if spec:
+            texts, spans = zip(*(data.spec_prompt(self.tokenizer, r) for r in rows))
+            enc = self._encode(list(texts), offsets=True)
+            offsets = enc.pop('offset_mapping')
+            lengths = enc['attention_mask'].sum(-1)
+            pool = torch.zeros(len(rows), k_max, enc['input_ids'].shape[1])
+            for i, row_spans in enumerate(spans):
+                start, end = offsets[i, :, 0], offsets[i, :, 1]
+                for k, (a, b) in enumerate(row_spans):
+                    inside = (start >= a) & (end <= b) & (end > start)
+                    if not inside.any():  # option truncated away: fall back to the last token
+                        inside[lengths[i] - 1] = True
+                    pool[i, k] = inside.float() / inside.sum()
+            batch.update(spec=dict(enc), pool=pool)
+        if decision:
+            clipped = [self._clip(r) for r in rows]
+            if self.mode == 'joint':
+                texts = [data.joint_prompt(self.tokenizer, r, self.labels) for r in clipped]
+            else:
+                texts = [data.state_prompt(self.tokenizer, r) for r in clipped]
+            batch.update(decision=dict(self._encode(texts)))
         if torch.cuda.is_available():  # pinned memory -> asynchronous host-to-device copies
             batch = _map_tensors(batch, lambda t: t.pin_memory())
         return batch
@@ -241,6 +243,10 @@ class HyperHead(nn.Module):
             logits = logits + read['base']
         return logits
 
+    def mask_options(self, logits, n_options):
+        invalid = torch.arange(logits.shape[-1], device=logits.device)[None] >= n_options[:, None]
+        return logits.masked_fill(invalid, -1e9)
+
     def forward(self, batch):
         """batch: rows (list of dicts) or the output of prepare()."""
         if isinstance(batch, list):
@@ -248,8 +254,30 @@ class HyperHead(nn.Module):
         batch = self.to_device(batch)
         read = self.read_states(batch)
         logits = self.decide(self.generate_heads(batch), read)
-        invalid = torch.arange(logits.shape[-1], device=logits.device)[None] >= batch['n_options'][:, None]
-        return logits.masked_fill(invalid, -1e9), batch
+        return self.mask_options(logits, batch['n_options']), batch
+
+    def head_is_zero(self):
+        """True while the generator's output layers are still at their zero initialisation: every
+        generated logit is then exactly 0, so the hypernetwork pass can be skipped (joint mode then
+        equals the frozen answer-slot readout)."""
+        layers = (self.generator.option[-1], self.generator.bias[-1])
+        return all(not p.any() for layer in layers for p in (layer.weight, layer.bias))
+
+    @staticmethod
+    def split_heads(head, n_options):
+        """Batched head -> one head per row (cacheable per spec)."""
+        return [dict(w=head['w'][i, :n], b=head['b'][i, :n], q=head['q'][i])
+                for i, n in enumerate(n_options.tolist())]
+
+    @staticmethod
+    def stack_heads(heads, k_max):
+        """Per-row heads -> a batched head padded to k_max options (padding is masked later)."""
+        w = torch.zeros(len(heads), k_max, heads[0]['w'].shape[-1], device=heads[0]['w'].device)
+        b = torch.zeros(len(heads), k_max, device=w.device)
+        for i, h in enumerate(heads):
+            w[i, :len(h['b'])] = h['w']
+            b[i, :len(h['b'])] = h['b']
+        return dict(w=w, b=b, q=torch.stack([h['q'] for h in heads]))
 
     # ------------------------------------------------------------------ io
     def trainable_state(self):
