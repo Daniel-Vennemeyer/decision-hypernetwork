@@ -42,10 +42,17 @@ def main():
     ap.add_argument('--lr-head', type=float, default=2e-4)
     ap.add_argument('--warmup', type=float, default=0.03)
     ap.add_argument('--kappa', type=float, default=0.05)
+    ap.add_argument('--anchor', choices=['auto', 'self', 'data', 'none'], default='auto',
+                    help="KL anchor / gain reference: the model's own frozen readout (self, joint "
+                         "mode only), the dataset's Qwen3.5-4B readout (data), or none (kappa 0). "
+                         "auto: self in joint mode; in split mode data for Qwen3.5-4B, else none")
     ap.add_argument('--gold-weight', type=float, default=0.0, help='mix gold labels into the teacher')
     ap.add_argument('--train-rows', type=int, default=None)
     ap.add_argument('--eval-rows', type=int, default=1000)
-    ap.add_argument('--eval-every', type=int, default=250, help='optimizer steps')
+    ap.add_argument('--eval-per-source', type=int, default=None,
+                    help='in-training eval on a fixed stratified subset (N rows per source)')
+    ap.add_argument('--eval-every', type=int, default=250,
+                    help='optimizer steps; 0 = no evaluation during training (checkpoint = last)')
     ap.add_argument('--log-every', type=int, default=10)
     ap.add_argument('--max-spec-tokens', type=int, default=8192,
                     help='micro-batch cap: rows x longest spec prompt (hypernetwork pass, with grads)')
@@ -71,11 +78,24 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     (out / 'args.json').write_text(json.dumps(vars(args), indent=2))
 
+    anchor = args.anchor
+    if anchor == 'auto':
+        anchor = 'self' if args.mode == 'joint' else ('data' if 'Qwen3.5-4B' in args.base else 'none')
+    if anchor == 'self' and args.mode != 'joint':
+        raise SystemExit('--anchor self needs joint mode (split mode has no frozen readout)')
+    if anchor == 'none':
+        args.kappa = 0.0
+    print(f'anchor: {anchor}' + ('' if anchor != 'none' else
+          " (gain is then measured against the dataset's Qwen3.5-4B readout)"), flush=True)
     model = HyperHead(args.base, mode=args.mode, rank=args.rank, queries=args.queries,
                       lora_r=args.lora_r, max_tokens=args.max_tokens, revision=args.revision,
                       gradient_checkpointing=not args.no_grad_ckpt).to(device)
     train_rows = data.read_jsonl(Path(args.data_dir) / 'train.jsonl', args.train_rows, args.seed)
-    val_rows = data.read_jsonl(Path(args.data_dir) / 'validation.jsonl', args.eval_rows, args.seed)
+    if args.eval_per_source:
+        val_rows = data.per_source_sample(data.read_jsonl(Path(args.data_dir) / 'validation.jsonl'),
+                                          args.eval_per_source)
+    else:
+        val_rows = data.read_jsonl(Path(args.data_dir) / 'validation.jsonl', args.eval_rows, args.seed)
     lora = [p for n, p in model.named_parameters() if p.requires_grad and 'lora_' in n]
     head = list(model.generator.parameters())
     print(f'trainable: lora {sum(p.numel() for p in lora)/1e6:.1f}M  head {sum(p.numel() for p in head)/1e6:.1f}M'
@@ -126,15 +146,18 @@ def main():
             f.write(json.dumps({'step': step, **summary, 'capabilities': result['capabilities']}) + '\n')
         return result['score']
 
-    best = run_eval(0)
-    model.save(out / 'best')
+    evaluating = args.eval_every > 0
+    best = run_eval(0) if evaluating else None
+    if evaluating:
+        model.save(out / 'best')
     model.train()
     step, t0, eval_seconds, running, rows_done = 0, time.time(), 0.0, {}, 0
     batch_rows = ([train_rows[j] for j in b] for b in batches)
     for i, batch in enumerate(prefetch(model.prepare, batch_rows)):
         logits, batch = model(batch)
+        p0 = batch['base'].softmax(-1) if anchor == 'self' else None
         loss, parts = distillation_loss(logits, batch['targets'], kappa=args.kappa,
-                                        gold_weight=args.gold_weight)
+                                        gold_weight=args.gold_weight, p0=p0)
         (loss / args.accum).backward()
         rows_done += len(batch['n_options'])
         for k, v in (parts | {'loss': loss.detach()}).items():  # stays on the GPU: no sync per step
@@ -159,13 +182,17 @@ def main():
             running = {}
         if args.max_steps and step >= args.max_steps:
             break
-        if step % args.eval_every == 0 or step == total_steps:
+        if evaluating and (step % args.eval_every == 0 or step == total_steps):
             score = run_eval(step)
             if score > best:
                 best = score
                 model.save(out / 'best')
     model.save(out / 'last')
-    print(f'done. best val score {best:.2f}')
+    if not evaluating:  # no validation during training: the final checkpoint is the one to use
+        model.save(out / 'best')
+        print('done (no in-training evaluation; best = last)')
+    else:
+        print(f'done. best val score {best:.2f}')
 
 
 if __name__ == '__main__':

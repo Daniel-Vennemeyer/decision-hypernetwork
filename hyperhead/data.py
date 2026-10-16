@@ -119,3 +119,17 @@ def token_batches(spec_lens, decision_lens, max_rows, max_spec_tokens, max_decis
     if shuffle:
         random.Random(seed).shuffle(batches)
     return batches
+
+
+def per_source_sample(rows, per_source, seed=0):
+    """Fixed stratified subset: at most per_source rows from every evaluation source, so a quick
+    eval still covers every dataset and is identical across runs (paired comparisons)."""
+    import collections
+    groups = collections.defaultdict(list)
+    for row in rows:
+        groups[row.get('evaluation_source', row['source'])].append(row)
+    picked = []
+    for source in sorted(groups):
+        group = sorted(groups[source], key=lambda r: r['id'])
+        picked += random.Random(f'{seed}:{source}').sample(group, min(per_source, len(group)))
+    return picked

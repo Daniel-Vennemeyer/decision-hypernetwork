@@ -13,6 +13,11 @@ import torch
 from hyperhead import data, metrics
 
 
+def predictions_path(result_path):
+    result_path = Path(result_path)
+    return result_path.with_name(result_path.stem + '.preds.jsonl')
+
+
 def spec_key(row):
     """Rows with the same key share a decision head (same type, question and options)."""
     return (row['type'], data.text(row['question']),
@@ -77,9 +82,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', help='directory written by HyperHead.save')
     ap.add_argument('--base', default='Qwen/Qwen3.5-4B', help='used without --checkpoint')
+    ap.add_argument('--revision', default=None, help='model revision for --base')
     ap.add_argument('--dataset', choices=['val', 'jeval'], default='val')
     ap.add_argument('--data-dir', default='data')
-    ap.add_argument('--limit', type=int, default=None)
+    ap.add_argument('--limit', type=int, default=None, help='random subset of this many rows')
+    ap.add_argument('--per-source', type=int, default=None,
+                    help='fixed stratified subset: at most N rows per evaluation source')
     ap.add_argument('--batch', type=int, default=8)
     ap.add_argument('--max-tokens', type=int, default=None,
                     help='input budget; JEVal inputs go up to 20,480 tokens (default: checkpoint value / 4096)')
@@ -94,7 +102,8 @@ def main():
     if args.checkpoint:
         model = HyperHead.load(args.checkpoint, **overrides)
     else:  # zero-initialised head in joint mode == the frozen answer-slot readout
-        model = HyperHead(args.base, mode='joint', gradient_checkpointing=False, **overrides)
+        model = HyperHead(args.base, mode='joint', revision=args.revision, gradient_checkpointing=False,
+                          **overrides)
     model.to(device).eval()
 
     if args.dataset == 'jeval':
@@ -105,6 +114,8 @@ def main():
             rows = random.Random(0).sample(rows, min(args.limit, len(rows)))
     else:
         rows = data.read_jsonl(Path(args.data_dir) / 'validation.jsonl', args.limit, 0)
+    if args.per_source:
+        rows = data.per_source_sample(rows, args.per_source)
 
     started = time.time()
     probs = predict(model, rows, args.batch, max_decision_tokens=args.max_decision_tokens, verbose=True)
@@ -113,7 +124,13 @@ def main():
     print(json.dumps({k: result[k] for k in ('n', 'score', 'accuracy', 'ece', 'brier', 'nll', 'capabilities')},
                      indent=2))
     if args.out:
-        Path(args.out).write_text(json.dumps(result, indent=2, ensure_ascii=False))
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+        with predictions_path(out).open('w') as f:  # per-row, for paired comparisons (compare.py)
+            for row, p in zip(rows, probs):
+                f.write(json.dumps(dict(id=row['id'], source=row.get('evaluation_source', row['source']),
+                                        type=row['type'], gold=row['gold_target'], probs=p)) + '\n')
 
 
 if __name__ == '__main__':

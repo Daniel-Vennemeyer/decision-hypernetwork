@@ -254,6 +254,8 @@ class HyperHead(nn.Module):
         batch = self.to_device(batch)
         read = self.read_states(batch)
         logits = self.decide(self.generate_heads(batch), read)
+        if read['base'] is not None:  # frozen answer-slot readout, the joint-mode anchor
+            batch['base'] = self.mask_options(read['base'], batch['n_options'])
         return self.mask_options(logits, batch['n_options']), batch
 
     def head_is_zero(self):

@@ -4,7 +4,9 @@
            + kappa * KL(p0 || p)
 
 teacher = averaged thinking-mode answer distribution of the same base model (train_target),
-p0      = the base model's no-thinking readout, used as an anchor.
+p0      = the base model's no-thinking readout, used as an anchor. In joint mode the anchor is
+          the model's own frozen answer-slot readout (== the dataset's p0 for Qwen3.5-4B, whose
+          readout produced it); pass it as p0= so other base models get their own anchor.
 """
 import torch
 
@@ -33,12 +35,12 @@ def targets(rows, width):
     )
 
 
-def distillation_loss(logits, t, kappa=0.05, kappa_hard_noul=0.2, gold_weight=0.0):
+def distillation_loss(logits, t, kappa=0.05, kappa_hard_noul=0.2, gold_weight=0.0, p0=None):
     """t: targets(...) on the logits' device. Returns (loss, parts); parts are detached GPU
     tensors so logging does not force a GPU sync every step.
 
-    parts['gain'] = CE(teacher, p0) - CE(teacher, p): how much closer to the teacher than the base
-    model's own no-thinking readout, on the same rows. 0 at the start of joint training,
+    parts['gain'] = CE(teacher, p0) - CE(teacher, p): how much closer to the teacher than the
+    anchor readout, on the same rows. 0 at the start of joint training,
     positive = learning. Unlike the raw CE it does not swing with batch difficulty."""
     logp = logits.float().log_softmax(-1)
     teacher = t['teacher']
@@ -50,7 +52,7 @@ def distillation_loss(logits, t, kappa=0.05, kappa_hard_noul=0.2, gold_weight=0.
     ordinal = 0.5 * t['is_score'] * (((logp.exp() - teacher) * levels).sum(-1)
                                      / (t['n'] - 1).clamp_min(1)).square()
     k = torch.where(t['hard_noul'], torch.full_like(ce, kappa_hard_noul), torch.full_like(ce, kappa))
-    p0 = t['p0']
+    p0 = t['p0'] if p0 is None else p0.detach()
     kl = k * (p0 * (p0.clamp_min(1e-30).log() - logp)).sum(-1)
     total = t['weight'] * (ce + ordinal) + kl
     ce_p0 = -(teacher * p0.clamp_min(1e-30).log()).sum(-1)

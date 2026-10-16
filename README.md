@@ -46,7 +46,7 @@ git clone https://github.com/Daniel-Vennemeyer/decision-hypernetwork.git ~/decis
 cd ~/decision-hypernetwork
 bash scripts/setup_cuda.sh   # venv, torch, fla + causal-conv1d kernels (checked), data, weights
 tmux new -s hyperhead        # the run takes hours
-bash scripts/run_4b.sh       # timing -> baseline eval -> joint training -> eval
+bash scripts/run.sh          # Qwen3.5-4B: timing -> baseline eval -> joint training -> eval
 ```
 
 The repo (code only) lives in `~/`. Everything the scripts write goes under `$WORK`, which
@@ -68,7 +68,31 @@ elsewhere in your home directory. To run `train.py` or `evaluate.py` by hand wit
 locations, first run `source scripts/env.sh && source $VENV/bin/activate`, and pass
 `--data-dir $DATA_DIR --out $RUNS_DIR/...`.
 
-`scripts/run_4b.sh` runs stages in order (choose them with `STAGES=...`):
+### Other base models and quick iterations
+
+```bash
+BASE=Qwen/Qwen3.5-0.8B-Base QUICK=1 bash scripts/run.sh                      # fast feedback loop
+QUICK=1 EXP=lr1e3 TRAIN_ARGS="--lr-head 1e-3" bash scripts/run.sh             # a named variant
+python compare.py $WORK/runs/base-qwen3.5-4b-quick-val.json $WORK/runs/joint-qwen3.5-4b-quick-val.json
+```
+
+- **Any Qwen3.5 base model.** `BASE` selects the model. Run directories and result files are
+  tagged with the model name (and `EXP`, if set), so runs never overwrite each other. Token
+  budgets scale up for smaller models.
+- **Anchor.** The KL anchor and the `gain` metric use the model's own frozen readout in joint
+  mode. For Qwen3.5-4B this equals the dataset's `p0`. The teacher is always Qwen3.5-4B's
+  thinking-mode distribution, so for other sizes this is cross-size distillation.
+- **`QUICK=1`.** No evaluation during training (the final checkpoint is used). Evaluation runs on
+  fixed stratified subsets: 25 rows per source on validation (~1.1k rows) and 30 per source on
+  JEVal (~1.7k rows), identical across runs.
+- **Baseline reuse.** The frozen-readout baseline is evaluated once per model and reused;
+  `FORCE=1` recomputes it.
+- **Paired comparisons.** Every evaluation also writes per-row predictions (`*.preds.jsonl`).
+  The eval stages finish with `compare.py` against the baseline: the paired accuracy difference
+  with a 95% bootstrap interval, an exact McNemar test on the answers that changed, the NLL
+  difference, and the sources that moved most.
+
+`scripts/run.sh` (or `run_4b.sh`, kept as an alias) runs stages in order (choose them with `STAGES=...`):
 
 | stage | what it does |
 |---|---|
